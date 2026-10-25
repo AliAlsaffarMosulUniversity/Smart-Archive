@@ -7,8 +7,8 @@ from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBo
 from core import *
 
 class Window(QMainWindow):
-    def __init__(self):
-        super().__init__(); self.setWindowTitle('الأرشيف الذكي | Smart Archive • 0.1'); self.resize(1280,820)
+    def __init__(self,license_manager=None):
+        super().__init__(); self.license_manager=license_manager; self.license_blocked=False; self.setWindowTitle('الأرشيف الذكي | Smart Archive • 0.2'); self.resize(1280,820)
         self.proposals={}; self.jobs=queue.Queue(); self.busy=False; self.stop=threading.Event(); self.archive=None
         self.setAcceptDrops(True)
         base=QWidget(); self.setCentralWidget(base); layout=QVBoxLayout(base); layout.setContentsMargins(26,22,26,22)
@@ -20,6 +20,11 @@ class Window(QMainWindow):
         self.button(bar,'إضافة ملفات',self.pick)
         self.button(bar,'إضافة مجلد',self.pick_folder)
         self.button(bar,'إيقاف بعد الملف الحالي',lambda:self.stop.set())
+        self.license_status=QLabel(''); layout.addWidget(self.license_status)
+        if self.license_manager:
+            self.button(bar,'التفعيل والترخيص',self.activation)
+            self.license_timer=QTimer(self); self.license_timer.timeout.connect(self.check_license); self.license_timer.start(60000)
+            self.check_license()
         self.tabs=QTabWidget(); layout.addWidget(self.tabs)
         review=QWidget(); rl=QVBoxLayout(review); self.tabs.addTab(review,'الوارد والمراجعة')
         split=QSplitter(); rl.addWidget(split)
@@ -47,6 +52,28 @@ class Window(QMainWindow):
         self.progress=QProgressBar(); layout.addWidget(self.progress); self.status=QLabel('اسحب الملفات هنا للبدء. لا تُنقل الأصول ولا تُرفع المستندات إلى الإنترنت.'); layout.addWidget(self.status)
         self.timer=QTimer(); self.timer.timeout.connect(self.poll); self.timer.start(150)
         self.setStyleSheet('''QWidget{background:#101827;color:#e5eaf3;font-family:"Segoe UI";font-size:13px} QLabel#title{font-size:30px;font-weight:700;color:#e9c67c} QPushButton{background:#25334a;border:1px solid #3b4a63;border-radius:7px;padding:10px} QPushButton:hover{background:#354765} QPushButton#primary{background:#b08a42;color:white} QLineEdit,QComboBox,QTextEdit{background:#182439;border:1px solid #34435b;border-radius:5px;padding:7px} QTableWidget{background:#142036;gridline-color:#2a3850;selection-background-color:#38516d} QHeaderView::section{background:#25334a;padding:9px;border:0} QTabBar::tab{padding:12px 24px;background:#1c2b40} QTabBar::tab:selected{color:#e9c67c;background:#30415a} QProgressBar{height:8px;border:0;background:#25334a} QProgressBar::chunk{background:#d2b16b}''')
+    def activation(self):
+        from licensing_ui import ActivationDialog
+        ActivationDialog(self.license_manager,self).exec()
+        self.check_license()
+    def check_license(self):
+        if self.license_blocked: return
+        try:
+            result=self.license_manager.check()
+            if result['active']:
+                self.license_status.setText('ترخيص دائم مفعّل' if result['licensed'] else f"نسخة تجريبية — متبقٍ {result['days']} يومًا")
+                return
+        except Exception: pass
+        # Block new work immediately; current background work finishes before modal lock.
+        self.stop.set()
+        if getattr(self,'busy',False): return
+        self.license_blocked=True
+        from licensing_ui import ActivationDialog
+        from PySide6.QtWidgets import QDialog
+        if ActivationDialog(self.license_manager,self).exec()!=QDialog.Accepted:
+            QApplication.instance().quit(); return
+        self.license_blocked=False
+        self.check_license()
     def button(self,layout,text,fn):
         b=QPushButton(text); b.clicked.connect(fn); layout.addWidget(b); return b
     def warn(self,e): QMessageBox.warning(self,'تنبيه',str(e))
@@ -65,6 +92,11 @@ class Window(QMainWindow):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
     def dropEvent(self,event): self.scan([u.toLocalFile() for u in event.mimeData().urls() if Path(u.toLocalFile()).is_file()])
     def scan(self,files):
+        if self.license_manager:
+            self.check_license()
+            try:
+                if not self.license_manager.check()['active']: return
+            except Exception: return
         if self.busy: return self.warn('توجد معالجة قيد التنفيذ')
         files=list(dict.fromkeys(str(Path(f).resolve()) for f in files))
         if not files: return
@@ -108,6 +140,11 @@ class Window(QMainWindow):
         if not self.archive: self.archive=Archive(root)
         return self.archive
     def save(self):
+        if self.license_manager:
+            self.check_license()
+            try:
+                if not self.license_manager.check()['active']: return
+            except Exception: return
         if self.busy: return self.warn('انتظر انتهاء العملية الحالية')
         p=self.current()
         if not p: return self.warn('اختر ملفًا صالحًا أولًا')
@@ -166,4 +203,13 @@ class Window(QMainWindow):
         event.accept()
 
 if __name__=='__main__':
-    app=QApplication(sys.argv); app.setLayoutDirection(Qt.LayoutDirection.RightToLeft); win=Window(); win.show(); sys.exit(app.exec())
+    app=QApplication(sys.argv); app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    from licensing import Licensing
+    from licensing_ui import ActivationDialog
+    from PySide6.QtWidgets import QDialog
+    try:
+        manager=Licensing()
+        if ActivationDialog(manager).exec()!=QDialog.Accepted: sys.exit(0)
+    except Exception as e:
+        QMessageBox.critical(None,'تعذر بدء البرنامج',str(e)); sys.exit(1)
+    win=Window(manager); win.show(); sys.exit(app.exec())
