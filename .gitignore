@@ -4,6 +4,8 @@ __pycache__/
 build/
 dist/
 release/
+models/
+ocr/
 *.sqlite3*
 *private_key*
 SmartArchiveOwner/

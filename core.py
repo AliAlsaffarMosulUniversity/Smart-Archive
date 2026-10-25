@@ -1,5 +1,6 @@
 """Local document extraction, review proposals and verified archival."""
 from __future__ import annotations
+import sys
 import csv, hashlib, json, os, re, shutil, sqlite3, subprocess, tempfile, unicodedata, uuid
 from pathlib import Path
 from datetime import datetime
@@ -33,12 +34,34 @@ def digest(path):
         for block in iter(lambda:f.read(1024*1024),b''): h.update(block)
     return h.hexdigest()
 
+def ocr_command():
+    base=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
+    bundled=base/'ocr'/'tesseract.exe'
+    executable=str(bundled) if bundled.is_file() else shutil.which('tesseract')
+    if not executable: raise ValueError('مكوّن قراءة الصور غير موجود. أعد تثبيت الإصدار الكامل 0.3.')
+    args=[executable]
+    if bundled.is_file(): args+=['--tessdata-dir',str(base/'ocr'/'tessdata')]
+    return args
+
 def ocr_image(path):
-    executable=shutil.which('tesseract')
-    if not executable: raise ValueError('يلزم تثبيت Tesseract وإضافة ara وeng إلى لغاته ثم PATH.')
-    result=subprocess.run([executable,str(path),'stdout','-l','ara+eng','--psm','3'],capture_output=True,timeout=180)
-    if result.returncode: raise ValueError(result.stderr.decode('utf8',errors='replace')[-600:])
+    args=ocr_command()+[str(path),'stdout','-l','ara+eng','--oem','1','--psm','3']
+    options={'creationflags':subprocess.CREATE_NO_WINDOW} if sys.platform=='win32' else {}
+    result=subprocess.run(args,capture_output=True,timeout=180,**options)
+    if result.returncode: raise ValueError('تعذرت قراءة الصورة. تحقق من سلامة مكونات القراءة وجودة الملف.')
     return result.stdout.decode('utf8',errors='replace')
+
+def render_pdf_page(path,index,target):
+    import pypdfium2 as pdfium
+    document=pdfium.PdfDocument(str(path))
+    try:
+        page=document[index]
+        try:
+            bitmap=page.render(scale=2.8)
+            try:
+                image=bitmap.to_pil(); image.save(target); image.close()
+            finally: bitmap.close()
+        finally: page.close()
+    finally: document.close()
 
 def extract(path):
     p=Path(path); ext=p.suffix.lower(); pages=[]; warnings=[]
@@ -51,13 +74,9 @@ def extract(path):
         for i,page in enumerate(r.pages,1):
             text=page.extract_text() or ''
             if len(text.strip())<30:
-                renderer=shutil.which('pdftoppm')
-                if renderer:
-                    with tempfile.TemporaryDirectory() as d:
-                        prefix=str(Path(d)/'page')
-                        subprocess.run([renderer,'-f',str(i),'-l',str(i),'-r','200','-singlefile','-png',str(p),prefix],check=True,capture_output=True,timeout=180)
-                        text=ocr_image(prefix+'.png'); warnings.append(f'الصفحة {i}: OCR؛ راجع الدقة')
-                else: warnings.append(f'الصفحة {i}: تحتاج OCR وPoppler')
+                with tempfile.TemporaryDirectory() as d:
+                    target=Path(d)/'page.png'; render_pdf_page(p,i-1,target)
+                    text=ocr_image(target); warnings.append(f'الصفحة {i}: نص مقروء من صورة؛ راجع الأسماء والتواريخ')
             pages.append({'location':f'صفحة {i}','text':text})
     elif ext=='.docx':
         from docx import Document
@@ -99,7 +118,7 @@ def propose(path,pages,warnings=None):
     hits={c:[key for key in keys if normalize(key) in n] for c,keys in RULES.items()}
     ranked=sorted(((len(v),c) for c,v in hits.items() if v),reverse=True)
     category=ranked[0][1] if ranked else 'يحتاج مراجعة'
-    # All dates must carry an explicit issue-date label on the same line.
+    # Extract labeled metadata before weighting subject-specific classification.
     evidence={}; date=''; issuer=''; number=''; subject=''
     for page in pages:
         for raw in page['text'].splitlines():
@@ -118,6 +137,24 @@ def propose(path,pages,warnings=None):
                 number=re.split('[:：]',raw,maxsplit=1)[-1].strip(); evidence['number']={'location':page['location'],'quote':raw}
             if not subject and re.match(r'^\s*(?:الموضوع|م/|م\s*:)\s*',raw):
                 subject=re.sub(r'^\s*(?:الموضوع\s*[:：]?|م/|م\s*:)\s*','',raw); evidence['subject']={'location':page['location'],'quote':raw}
+    if subject:
+        title=normalize(subject)
+        title_hits={c:sum(normalize(key) in title for key in keys) for c,keys in RULES.items()}
+        if any(title_hits.values()):
+            category=max(title_hits,key=title_hits.get)
+    else:
+        # A standalone heading carries more weight than incidental mentions in body text.
+        headings=[normalize(line.strip()) for page in pages for line in page['text'].splitlines()[:30] if len(line.strip())<65]
+        for c,keys in RULES.items():
+            if any(h in [normalize(k) for k in keys] for h in headings): category=c; break
+    if not issuer and pages:
+        candidates=[]
+        for raw in pages[0]['text'].splitlines()[:16]:
+            line=normalize(raw.strip())
+            if re.match(r'^(?:وزارة|جامعه|جامعة|كلية|رئاسة جامعة|مركز)\s+',line) and not re.match(r'^(?:الى|الي|الموضوع)',line):
+                candidates.append(raw.strip())
+        if candidates:
+            issuer=' / '.join(candidates[:3]); evidence['issuer']={'location':pages[0]['location'],'quote':' / '.join(candidates[:3])}
     for c in hits:
         if hits[c]:
             for page in pages:
@@ -127,7 +164,22 @@ def propose(path,pages,warnings=None):
     if not issuer: notes.append('الجهة المصدرة غير مؤكدة؛ أدخلها يدويًا')
     if not date: notes.append('تاريخ الإصدار الميلادي غير مؤكد؛ لا يُستخدم تاريخ الملف')
     if len(ranked)>1: notes.append('موضوعات متعددة؛ راجع التصنيف الرئيسي')
-    return {'source':str(Path(path).resolve()),'sha256':digest(path),'category':category,'date':date,'year':date[:4] or 'غير محدد','issuer':issuer,'number':number,'subject':subject,'tags':[c for _,c in ranked], 'evidence':evidence,'pages':pages,'notes':notes,'engine':'قواعد محلية؛ يلزم اعتماد المستخدم'}
+    semantic_result=None
+    try:
+        from semantic import classify
+        semantic_result=classify(text,subject)
+        explicit_title=bool(subject and any(normalize(key) in normalize(subject) for keys in RULES.values() for key in keys))
+        if not explicit_title:
+            category=semantic_result['category']
+            if semantic_result['uncertain']: notes.append('المعنى يحتمل أكثر من تصنيف؛ راجع النوع المقترح')
+        elif semantic_result['category'] not in (category,'يحتاج مراجعة'):
+            notes.append('العنوان والمعنى يحتملان تصنيفين؛ راجع نوع الوثيقة')
+        evidence['semantic']={'location':'مقتطف دلالي من محتوى الوثيقة','quote':semantic_result['quote']}
+    except FileNotFoundError:
+        notes.append('النموذج الدلالي غير متاح في بيئة التطوير؛ التصنيف بالقواعد')
+    except Exception:
+        notes.append('تعذر التحليل الدلالي لهذا الملف؛ راجع التصنيف اليدوي')
+    return {'source':str(Path(path).resolve()),'sha256':digest(path),'category':category,'date':date,'year':date[:4] or 'غير محدد','issuer':issuer,'number':number,'subject':subject,'tags':[c for _,c in ranked], 'evidence':evidence,'pages':pages,'notes':notes,'semantic':semantic_result,'engine':'تحليل دلالي محلي مع قواعد' if semantic_result else 'قواعد محلية؛ يلزم اعتماد المستخدم'}
 
 def local_ai(proposal,model):
     """Optional fixed-loopback Ollama suggestion. Does not override evidence or approved fields."""
@@ -175,7 +227,7 @@ class Archive:
         rows=self.db.execute("SELECT id,category,year,issuer,subject,destination,status FROM documents WHERE content LIKE ? OR metadata LIKE ? ORDER BY rowid DESC",(pattern,'%'+q+'%')).fetchall()
         return rows
     def undo(self,ident):
-        row=self.db.execute("SELECT destination,sha,status FROM documents WHERE id=?",(ident,)).fetchone()
+        row=self.db.execute("SELECT destination,sha,status,metadata FROM documents WHERE id=?",(ident,)).fetchone()
         if not row or row[2]!='active': raise ValueError('لا توجد عملية فعالة')
         path=Path(row[0])
         if not path.resolve().is_relative_to(self.root): raise ValueError('مسار خارج الأرشيف')
@@ -184,8 +236,32 @@ class Archive:
         recovery=self.root/'recovery'; recovery.mkdir(exist_ok=True)
         target=recovery/(ident+path.suffix)
         if target.exists(): raise ValueError('نسخة استعادة موجودة')
+        metadata=json.loads(row[3]); metadata['_restore_destination']=str(path)
         path.rename(target)
-        self.db.execute("UPDATE documents SET status='undone',destination=? WHERE id=?",(str(target),ident)); self.db.commit()
+        try:
+            self.db.execute("UPDATE documents SET status='undone',destination=?,metadata=? WHERE id=?",(str(target),json.dumps(metadata,ensure_ascii=False),ident)); self.db.commit()
+        except Exception:
+            path.rename(target); raise
+    def restore(self,ident):
+        row=self.db.execute("SELECT destination,sha,status,metadata FROM documents WHERE id=?",(ident,)).fetchone()
+        if not row or row[2]!='undone': raise ValueError('لا توجد نسخة في سلة الاستعادة')
+        source=Path(row[0]); metadata=json.loads(row[3]); original=metadata.get('_restore_destination')
+        if not original: raise ValueError('هذا سجل من إصدار قديم؛ افتح مجلد recovery للاستعادة اليدوية')
+        target=Path(original)
+        if not source.resolve().is_relative_to(self.root) or not target.resolve().is_relative_to(self.root): raise ValueError('مسار غير آمن')
+        if not source.is_file() or digest(source)!=row[1]: raise ValueError('تغيرت النسخة؛ تعذرت الاستعادة')
+        if target.exists(): raise ValueError('يوجد ملف في المسار المطلوب؛ لن يُستبدل')
+        target.parent.mkdir(parents=True,exist_ok=True)
+        # Exclusive destination prevents replacing a concurrently created file on Windows or Unix.
+        try:
+            with source.open('rb') as src,target.open('xb') as dest:
+                shutil.copyfileobj(src,dest); dest.flush(); os.fsync(dest.fileno())
+            if digest(target)!=row[1]: raise ValueError('فشل التحقق من النسخة المستعادة')
+            self.db.execute("UPDATE documents SET status='active',destination=? WHERE id=?",(str(target),ident)); self.db.commit()
+        except Exception:
+            raise
+        source.unlink()
+        return str(target)
     def export(self,path):
         with open(path,'w',encoding='utf-8-sig',newline='') as f:
             w=csv.writer(f); w.writerow(['المعرف','التصنيف','السنة','الجهة','الموضوع','المسار','الحالة'])

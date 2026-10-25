@@ -12,9 +12,18 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements.txt
+      - run: python tools/prepare_ocr.py
+      - run: python tools/prepare_model.py
       - run: python -m unittest discover -s tests -v
       - run: python -m pip freeze > requirements-resolved.txt
-      - run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name SmartArchive --collect-all pypdf --collect-all docx --collect-all openpyxl --collect-all pptx --collect-all PIL app.py
+      - run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name SmartArchive --collect-all pypdf --collect-all docx --collect-all openpyxl --collect-all pptx --collect-all PIL --collect-all pypdfium2 --collect-all pypdfium2_raw --collect-all onnxruntime --collect-all tokenizers --add-data "ocr;ocr" --add-data "models;models" app.py
+      - name: Test the packaged Windows executable and bundled processing
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\dist\SmartArchive\SmartArchive.exe -ArgumentList '--self-test','--report',"$PWD\PACKAGED-SELF-TEST.txt" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content PACKAGED-SELF-TEST.txt -ErrorAction SilentlyContinue; throw "Packaged application test failed" }
+          $report = Get-Content PACKAGED-SELF-TEST.txt
+          if ($report -notmatch '^PASS:') { throw "Missing packaged application test report" }
       - name: Build installer when Inno Setup is available
         shell: pwsh
         run: |
@@ -27,3 +36,4 @@ jobs:
             dist/SmartArchive/
             release/
             requirements-resolved.txt
+            PACKAGED-SELF-TEST.txt
